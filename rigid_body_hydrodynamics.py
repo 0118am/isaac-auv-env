@@ -1,159 +1,191 @@
 """
-Compute hydrodynamic forces and torques on a rigid body
+Fossen-style hydrodynamic wrenches for a rigid AUV body.
 
-Based on the descriptions of the MuJoCo hydrodynamic model: https://mujoco.readthedocs.io/en/3.0.1/computation/fluid.html
-
-Authors: Ethan Fahnestock and Levi "Veevee" Cai (cail@mit.edu)
+Isaac/PhysX integrates the rigid-body inertia, gyroscopic terms, and gravity.
+This module therefore returns only the external fluid wrench to apply in the
+body/link frame: buoyancy, relative-velocity damping, and optional added-mass
+Coriolis terms.  Keeping that boundary explicit prevents double-counting the
+rigid-body part of Fossen's 6-DOF model.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Tuple
-from isaaclab.utils.math import quat_conjugate, quat_inv, quat_apply, convert_quat
-import numpy as np 
-import torch 
+
+import torch
+
+
+def quat_conjugate_wxyz(q: torch.Tensor) -> torch.Tensor:
+    """Quaternion conjugate for IsaacLab's (w, x, y, z) convention."""
+
+    return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1)
+
+
+def quat_apply_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Rotate vectors with quaternions in IsaacLab's (w, x, y, z) convention."""
+
+    q = q.reshape(-1, 4)
+    v = v.reshape(-1, 3)
+    xyz = q[:, 1:]
+    t = 2.0 * torch.cross(xyz, v, dim=-1)
+    return v + q[:, 0:1] * t + torch.cross(xyz, t, dim=-1)
+
+
+def skew_symmetric(vec: torch.Tensor) -> torch.Tensor:
+    """Return S(vec), where S(a) b = a x b."""
+
+    mat = torch.zeros((*vec.shape[:-1], 3, 3), dtype=vec.dtype, device=vec.device)
+    mat[..., 0, 1] = -vec[..., 2]
+    mat[..., 0, 2] = vec[..., 1]
+    mat[..., 1, 0] = vec[..., 2]
+    mat[..., 1, 2] = -vec[..., 0]
+    mat[..., 2, 0] = -vec[..., 1]
+    mat[..., 2, 1] = vec[..., 0]
+    return mat
+
 
 @dataclass
 class HydrodynamicForceModels:
-  num_envs: int 
-  device: torch.device
-  debug: bool = False
+    num_envs: int
+    device: torch.device
+    debug: bool = False
 
-  def calculate_buoyancy_forces(self,
-                                root_quats_w: torch.tensor, # robot orientations in world frame
-                                fluid_density: float, # fluid density
-                                volumes: torch.tensor, # rigid body volume 
-                                g_mag: float, # magnitude of gravity
-                                com_to_cob_offsets:torch.tensor) -> Tuple[torch.tensor, torch.tensor]:
-    """
-    Compute wrenches (forces and torques) due to buoyancy on fully-submerged rigid body in fluid.
-    Returned forces and torques are in the body root frame.
-    Note that gravity is applied by Isaac Sim by default.
-    """
+    def calculate_buoyancy_forces(
+        self,
+        root_quats_w: torch.Tensor,
+        gravity_w: torch.Tensor,
+        fluid_density: float,
+        volumes: torch.Tensor,
+        com_to_cob_offsets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute buoyancy in body frame.
 
-    buoyancy_forces_b = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
-    buoyancy_torques_b = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
+        PhysX already applies gravity at the COM.  We only add buoyancy here,
+        but use the same world gravity vector so neutral buoyancy can be checked
+        in one frame: F_g^w + F_b^w ~= 0 when m = rho * V.
+        """
 
-    buoyancy_directions_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
-    buoyancy_directions_w[..., 2] = 1.0 # opposing gravity vector in the world frame
-    
-    if self.debug: print(f"shape of root_quats: {root_quats.shape}, shape of buoyancy_vectors: {buoyancy_vectors_w.shape}")
+        if gravity_w.ndim == 1:
+            gravity_w = gravity_w.reshape(1, 3).repeat(self.num_envs, 1)
 
-    buoyancy_directions_b = quat_apply(quat_conjugate(root_quats_w), buoyancy_directions_w)
+        buoyancy_forces_w = -fluid_density * volumes * gravity_w
+        buoyancy_forces_b = quat_apply_wxyz(quat_conjugate_wxyz(root_quats_w), buoyancy_forces_w)
+        buoyancy_torques_b = torch.cross(com_to_cob_offsets, buoyancy_forces_b, dim=-1)
 
-    # todo: we should actually be computing buoyancy forces at the root of the vehicle, not the COB, is this the same though?
-    buoyancy_forces_at_cob_b = buoyancy_directions_b * fluid_density * volumes.repeat(1,3) * g_mag
-    buoyancy_forces_b = buoyancy_forces_at_cob_b
+        if self.debug:
+            print(f"buoyancy_forces_b={buoyancy_forces_b}, buoyancy_torques_b={buoyancy_torques_b}")
 
-    buoyancy_torques_b = torch.cross(com_to_cob_offsets, buoyancy_forces_at_cob_b, dim=-1) # torque = r x F
+        return buoyancy_forces_b, buoyancy_torques_b
 
-    if self.debug: print(f"Calculated buoyancy values: forces are {buoyancy_forces_b} and torques are {buoyancy_torques_b}")
+    def calculate_fossen_fluid_forces(
+        self,
+        root_quats_w: torch.Tensor,
+        root_linvels_b: torch.Tensor,
+        root_angvels_b: torch.Tensor,
+        gravity_w: torch.Tensor,
+        fluid_density: float,
+        volumes: torch.Tensor,
+        com_to_cob_offsets: torch.Tensor,
+        linear_damping: torch.Tensor,
+        quadratic_damping: torch.Tensor,
+        water_current_w: torch.Tensor,
+        added_mass_diag: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the body-frame fluid wrench.
 
-    return (buoyancy_forces_b, buoyancy_torques_b)
-  
-  def _calculate_inferred_half_dimensions(self, inertias, masses):
-    """
-    Computes inferred half dimensions for an "equivalent inertia box" of the vehicle
-    """
-    r = torch.sqrt( (3/(2 * masses.repeat(1,3))) * (torch.roll(inertias, 1, 1) + torch.roll(inertias, -1, 1) - inertias))
-    return r
+        Damping is evaluated with relative velocity nu_r = nu - nu_c.  The
+        dissipation check should therefore use nu_r^T tau_damping <= 0, not
+        nu^T tau_damping, because moving water can do work on the vehicle.
+        """
 
-  def calculate_quadratic_drag_forces(self,
-                                  root_linvels_b: torch.tensor,
-                                  root_angvels_b: torch.tensor,
-                                  inertias: torch.tensor,
-                                  masses: torch.tensor,
-                                  fluid_density_rho
-                                  ):
+        buoyancy_forces_b, buoyancy_torques_b = self.calculate_buoyancy_forces(
+            root_quats_w,
+            gravity_w,
+            fluid_density,
+            volumes,
+            com_to_cob_offsets,
+        )
 
-    ri = self._calculate_inferred_half_dimensions(inertias, masses)
-    rj = torch.roll(ri, 1, 1)
-    rk = torch.roll(ri, -1, 1)
+        if water_current_w.ndim == 1:
+            water_current_w = water_current_w.reshape(1, 3).repeat(self.num_envs, 1)
+        water_current_b = quat_apply_wxyz(quat_conjugate_wxyz(root_quats_w), water_current_w)
 
-    forces = -2. * fluid_density_rho * rj * rk * torch.abs(root_linvels_b) * root_linvels_b
-    torques = -0.5 * fluid_density_rho * ri * (torch.pow(rj,4) + torch.pow(rk,4)) * torch.abs(root_angvels_b) * root_angvels_b
+        nu = torch.cat((root_linvels_b, root_angvels_b), dim=-1)
+        nu_current = torch.zeros_like(nu)
+        nu_current[:, 0:3] = water_current_b
+        nu_r = nu - nu_current
 
-    return (forces, torques)
+        damping_diag = linear_damping.reshape(1, 6) + quadratic_damping.reshape(1, 6) * torch.abs(nu_r)
+        damping_wrench = -damping_diag * nu_r
 
-  def calculate_linear_viscous_forces(self, 
-                                      root_linvels_b: torch.tensor,
-                                      root_angvels_b: torch.tensor,
-                                      inertias: torch.tensor,
-                                      masses,
-                                      fluid_viscosity_beta
-                                      ):
-    ri = self._calculate_inferred_half_dimensions(inertias, masses)
-    r_eq = torch.mean(ri, 1, keepdim=True)
+        added_coriolis_wrench = torch.zeros_like(nu)
+        if added_mass_diag is not None and torch.any(added_mass_diag != 0.0):
+            added_coriolis_wrench = -self.calculate_added_mass_coriolis_wrench(nu_r, added_mass_diag)
 
-    r_eq = r_eq.repeat(1,3)
-    forces = -6. * fluid_viscosity_beta * torch.pi * r_eq * root_linvels_b
-    torques = -8. * fluid_viscosity_beta * torch.pi * torch.pow(r_eq, 3) * root_angvels_b
-    return (forces, torques)
+        fluid_wrench = torch.cat((buoyancy_forces_b, buoyancy_torques_b), dim=-1)
+        fluid_wrench = fluid_wrench + damping_wrench + added_coriolis_wrench
 
-  def calculate_density_and_viscosity_forces(self, 
-                                             root_quats_w: torch.tensor,
-                                             root_linvels_w:torch.tensor, #[num_envs, 3]
-                                             root_angvels_w:torch.tensor, #[num_envs, 3]
-                                             inertias: torch.Tensor, #[num_envs, 3]
-                                             inertias_mean: torch.Tensor, #[num_envs, 1]
-                                             water_beta: float, 
-                                             water_rho: float,
-                                             masses: torch.tensor
-                                             ):
+        if self.debug:
+            power = torch.sum(nu_r * damping_wrench, dim=-1)
+            print(f"relative damping power={power}")
 
-    root_quats_b = quat_conjugate(root_quats_w)
-    root_linvels_b = quat_apply(root_quats_b, root_linvels_w)
-    root_angvels_b = quat_apply(root_quats_b, root_angvels_w)
-  
-    f_d, g_d = self.calculate_quadratic_drag_forces(root_linvels_b, root_angvels_b, inertias, masses, water_rho)
-    f_v, g_v = self.calculate_linear_viscous_forces(root_linvels_b, root_angvels_b, inertias, masses, water_beta)
-    return (f_d, g_d, f_v, g_v)
+        return fluid_wrench[:, 0:3], fluid_wrench[:, 3:6]
+
+    def calculate_added_mass_coriolis_wrench(self, nu_r: torch.Tensor, added_mass_diag: torch.Tensor) -> torch.Tensor:
+        """Compute C_A(nu_r) nu_r for a diagonal added-mass matrix.
+
+        The environment applies ``-C_A nu_r`` as an external wrench.  The helper
+        returns ``C_A nu_r`` so tests can directly check skew-symmetry and power.
+        """
+
+        added_mass_diag = added_mass_diag.reshape(1, 6)
+        v = nu_r[:, 0:3]
+        omega = nu_r[:, 3:6]
+        a_linear = added_mass_diag[:, 0:3] * v
+        a_angular = added_mass_diag[:, 3:6] * omega
+
+        c_top = -torch.bmm(skew_symmetric(a_linear), omega.unsqueeze(-1)).squeeze(-1)
+        c_bottom = (
+            -torch.bmm(skew_symmetric(a_linear), v.unsqueeze(-1)).squeeze(-1)
+            - torch.bmm(skew_symmetric(a_angular), omega.unsqueeze(-1)).squeeze(-1)
+        )
+        return torch.cat((c_top, c_bottom), dim=-1)
+
+    def calculate_relative_damping_wrench(
+        self,
+        nu_r: torch.Tensor,
+        linear_damping: torch.Tensor,
+        quadratic_damping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Standalone damping helper used by tests and diagnostics."""
+
+        damping_diag = linear_damping.reshape(1, 6) + quadratic_damping.reshape(1, 6) * torch.abs(nu_r)
+        return -damping_diag * nu_r
+
 
 if __name__ == "__main__":
-  # do some unit tests! 
-  device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-  water_rho = 997.0 # kg/m^3
-  water_beta = 0.001306 # Pa s, dynamic viscosity of water @ 50 deg F
-  g_mag = 9.81
-  num_envs = 4
-  com_to_cob_offset = torch.tensor([0.0, 0.0, 0.3], dtype=torch.float, device=device, requires_grad=False).reshape(1,3).repeat(num_envs, 1) 
-  volume = 0.022747843530591776 # assuming cubic meters - NEUTRALLY BOUYANT
+    try:
+        from .bluerov2_heavy_model import BLUEROV2_HEAVY
+    except ImportError:
+        from bluerov2_heavy_model import BLUEROV2_HEAVY
 
-  forceModel = HydrodynamicForceModels(num_envs, device, True)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = HydrodynamicForceModels(num_envs=1, device=device)
 
-  root_quats = torch.tensor([[0.0, 0.0, 0.0, 1.0], # no rotation
-                             [-0.7071068, 0, 0, 0.7071068], # 90 deg rotation about x
-                             [ 0, -0.7071068, 0, 0.7071068 ], 
-                             [ 0.3535534, 0.3535534, 0.1464466, 0.8535534 ], 
-  
-  ]).to(device)
+    q_identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)
+    gravity_w = torch.tensor([0.0, 0.0, -9.81], device=device)
+    volume = torch.tensor([[BLUEROV2_HEAVY.neutral_buoyancy_volume_m3]], device=device)
+    rho = BLUEROV2_HEAVY.water_density_kg_m3
+    cob = torch.tensor([BLUEROV2_HEAVY.center_of_buoyancy_from_com_m], device=device)
+    force_b, torque_b = model.calculate_buoyancy_forces(q_identity, gravity_w, rho, volume, cob)
+    expected = torch.tensor([[0.0, 0.0, rho * volume.item() * 9.81]], device=device)
+    assert torch.allclose(force_b, expected, atol=1.0e-5), (force_b, expected)
+    assert torch.allclose(torque_b, torch.zeros_like(torque_b), atol=1.0e-5), torque_b
 
-  true_b_forces = torch.tensor([[0.0, 0.0, volume * water_rho * g_mag],
-                                [0.0, -1 * volume * water_rho * g_mag, 0.0], 
-                                [ volume * water_rho * g_mag, 0.0, 0.0], 
-                                [ -0.5 * volume * water_rho * g_mag, 0.7071 * volume * water_rho * g_mag, 0.5 * volume * water_rho * g_mag], 
-  
-  ]).to(device)
-
-  true_b_torques = torch.tensor([[0.0, 0.0, 0.0],
-                                  [0.3 * water_rho * g_mag * volume, 0.0, 0.0],
-                                  [0.0, 0.3 * water_rho * g_mag * volume, 0.0],
-                                  [-0.3 * 0.7071 * water_rho * g_mag * volume, -0.15 * water_rho * g_mag * volume, 0.0],
-  ]).to(device)
-
-  b_force, b_torque = forceModel.calculate_buoyancy_forces( root_quats, water_rho, volume, g_mag, com_to_cob_offset)
-
-  if(np.abs(b_force.cpu().numpy() - true_b_forces.cpu().numpy()).max() > 1e-9):
-    print(f"ERROR: b_force is\n {b_force} \nand true_b_forces is \n {true_b_forces}\n with max value {np.abs(b_force.cpu().numpy() - true_b_forces.cpu().numpy()).max()}")
-  if (np.abs(b_torque.cpu().numpy() - true_b_torques.cpu().numpy()).max() > 1e-9):
-    print(f"ERROR: b_torque is\n {b_torque} and true_b_torques is\n {true_b_torques}")
-
-
-  root_linvels = torch.tensor([[[0.0, 0.0, 0.0]],
-                               [[0.0, 0.0, 0.0]],
-  ])
-  root_angvels = torch.tensor([[[0.0, 0.0, 0.0]],
-                               [[0.0, 0.0, 0.0]],
-  ])
-
-  #env_inertia_tensors = 
-  #dens_force, dense_torqe, visc_force, visc_torque = forceModel.calculate_density_and_viscosity_forces(root_linvels, root_angvels, env_inertia_tensors, water_beta, water_rho)
+    nu_r = torch.tensor([[0.2, -0.1, 0.3, 0.04, -0.02, 0.01]], device=device)
+    linear = torch.ones(6, device=device) * 0.1
+    quadratic = torch.ones(6, device=device) * 2.0
+    damping = model.calculate_relative_damping_wrench(nu_r, linear, quadratic)
+    assert torch.all(torch.sum(nu_r * damping, dim=-1) <= 0.0)
+    print("Hydrodynamic sanity checks passed.")

@@ -4,7 +4,6 @@ from isaaclab.app import AppLauncher
 
 import cv2
 import numpy as np
-import isaaclab.utils.math as math_utils
 
 
 # local imports
@@ -12,7 +11,6 @@ import cli_args  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--cpu", action="store_true", default=False, help="Use CPU pipeline.")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
@@ -36,6 +34,7 @@ import os
 import torch
 import csv
 
+import isaaclab.utils.math as math_utils
 from rsl_rl.runners import OnPolicyRunner
 
 import isaaclab_tasks  # noqa: F401
@@ -69,7 +68,7 @@ def main():
     """Play with RSL-RL agent."""
     # parse configuration
     env_cfg = parse_env_cfg(
-        args_cli.task, use_gpu=not args_cli.cpu, num_envs=1, use_fabric=not args_cli.disable_fabric
+        args_cli.task, device=args_cli.device, num_envs=1, use_fabric=not args_cli.disable_fabric
     )
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
@@ -97,10 +96,18 @@ def main():
 
     # export policy to onnx
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(
-        ppo_runner.alg.actor_critic, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt"
-    )   
-    export_policy_as_onnx(ppo_runner.alg.actor_critic, path=export_model_dir, filename="policy.onnx")
+    try:
+        policy_nn = ppo_runner.alg.policy
+    except AttributeError:
+        policy_nn = ppo_runner.alg.actor_critic
+    if hasattr(policy_nn, "actor_obs_normalizer"):
+        normalizer = policy_nn.actor_obs_normalizer
+    elif hasattr(policy_nn, "student_obs_normalizer"):
+        normalizer = policy_nn.student_obs_normalizer
+    else:
+        normalizer = None
+    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     des_orientation = math_utils.default_orientation(1, env.unwrapped.device)
     des_euler_xyz = torch.zeros(1,3,device=env.unwrapped.device)
@@ -116,10 +123,10 @@ def main():
 
     # get the initial position
     init_pos_w = env.unwrapped._robot.data.root_pos_w
-    goal_pos_w = init_pos_w
+    goal_pos_w = init_pos_w.clone()
 
-    obs, _ = env.get_observations()
-    obs[:,0:4] = des_orientation
+    obs = env.get_observations()
+    obs["policy"][:, 0:4] = des_orientation
     prev_obs = obs.clone()
     # simulate environment
 
@@ -199,8 +206,8 @@ def main():
 
         # print(f"euler: {des_euler_xyz} | quat: {des_orientation} | meas_quat: {obs[:,7:11]}")
         obs = obs.clone()
-        obs[:,0:4] = des_orientation
-        obs[:,4:7] = offsets_from_origin
+        obs["policy"][:, 0:4] = des_orientation
+        obs["policy"][:, 4:7] = offsets_from_origin
         # print("desired orientation: ", des_euler_xyz, ", clipped offsets: ", offsets_from_origin)
         
         # run everything in inference mode

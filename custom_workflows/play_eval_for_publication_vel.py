@@ -8,7 +8,6 @@ import cli_args  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--cpu", action="store_true", default=False, help="Use CPU pipeline.")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
@@ -19,7 +18,7 @@ parser.add_argument("--eval_name", type=str, required=True, help="Name of the ev
 parser.add_argument("--custom_weights", type=str, default=None, help="Path to custom weights file")
 
 # Eval parameters
-parser.add_argument("--com_cob_offset", type=float, required=True, help="Distance of center of buoyancy from the center of mass along the X axis")
+parser.add_argument("--com_cob_offset", type=float, required=True, help="Distance of center of buoyancy from the center of mass along the body z axis")
 parser.add_argument("--volume", type=float, required=True, help="Volume of the robot for buoyancy force estimates")
 parser.add_argument("--action_noise_std", type=float, required=True, help="Standard deviation of action noise distribution")
 parser.add_argument("--observation_noise_std", type=float, required=True, help="Standard deviation of observation noise distribution")
@@ -65,7 +64,7 @@ def main():
     """Play with RSL-RL agent."""
     # parse configuration
     env_cfg = parse_env_cfg(
-        args_cli.task, use_gpu=not args_cli.cpu, num_envs=1, use_fabric=not args_cli.disable_fabric
+        args_cli.task, device=args_cli.device, num_envs=1, use_fabric=not args_cli.disable_fabric
     )
 
     action_noise_std = torch.full((env_cfg.num_actions,), args_cli.action_noise_std, dtype=torch.float32, device=env_cfg.sim.device)
@@ -83,7 +82,7 @@ def main():
     )
 
     env_cfg.domain_randomization.use_custom_randomization = False
-    env_cfg.com_to_cob_offset[0] += args_cli.com_cob_offset
+    env_cfg.com_to_cob_offset[2] += args_cli.com_cob_offset
     env_cfg.volume = args_cli.volume
 
     env_cfg.use_boundaries = False
@@ -130,33 +129,26 @@ def main():
     # path for saving csv logs
     eval_csv_path = os.path.join(save_path, "logs.csv")
 
-    # create dataframe to save results into
-    log_df = pd.DataFrame(columns=[
-        'des_x_vel', 
-        'des_y_vel', 
-        'des_z_vel', 
-        'des_roll_vel', 
-        'des_pitch_vel', 
-        'des_yaw_vel',
-        'true_x_vel',
-        'true_y_vel',
-        'true_z_vel',
-        'true_roll_vel',
-        'true_pitch_vel',
-        'true_yaw_vel',
-        'mse',
-        'reward'
-        ])
+    # store rows as dictionaries so pandas keeps all evaluation-specific columns.
+    log_rows = []
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     # export policy to onnx
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(
-        ppo_runner.alg.actor_critic, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt"
-    )
-    export_policy_as_onnx(ppo_runner.alg.actor_critic, path=export_model_dir, filename="policy.onnx")
+    try:
+        policy_nn = ppo_runner.alg.policy
+    except AttributeError:
+        policy_nn = ppo_runner.alg.actor_critic
+    if hasattr(policy_nn, "actor_obs_normalizer"):
+        normalizer = policy_nn.actor_obs_normalizer
+    elif hasattr(policy_nn, "student_obs_normalizer"):
+        normalizer = policy_nn.student_obs_normalizer
+    else:
+        normalizer = None
+    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     axes_directions_list = [
         (0, 1),
@@ -170,7 +162,7 @@ def main():
     ]
 
     # reset environment
-    obs, _ = env.get_observations()
+    obs = env.get_observations()
 
     # initialize variables to track current action
     action_iter = 0
@@ -185,12 +177,12 @@ def main():
 
         # run everything in inference mode
         with torch.inference_mode():
-            obs[0, :3] = torch.Tensor([0.0 if i != axis else direction for i in range(3)])
-            obs[0, 3:7] = quat_from_angle_axis(torch.Tensor([direction * 1.5708]), torch.Tensor([[0 if (i + 3) != axis else 1 for i in range(3)]]))[0]
+            obs["policy"][0, :3] = torch.Tensor([0.0 if i != axis else direction for i in range(3)]).to(env_cfg.sim.device)
+            obs["policy"][0, 3:7] = quat_from_angle_axis(torch.Tensor([direction * 1.5708]), torch.Tensor([[0 if (i + 3) != axis else 1 for i in range(3)]]))[0].to(env_cfg.sim.device)
             print("obs: ", obs)
 
-            des_lin_vels = obs[0, :3].cpu().numpy()
-            des_ang = obs[0, 3:7]
+            des_lin_vels = obs["policy"][0, :3].cpu().numpy()
+            des_ang = obs["policy"][0, 3:7]
 
             # agent stepping
             actions = policy(obs)
@@ -198,10 +190,10 @@ def main():
             # env stepping
             obs, _, _, _ = env.step(actions)
 
-            true_lin_vels = obs[0, 7:10].cpu().numpy()
+            true_lin_vels = obs["policy"][0, 7:10].cpu().numpy()
             lin_vel_error = np.linalg.norm(des_lin_vels - true_lin_vels)
 
-            true_ang = obs[0, 10:14]
+            true_ang = obs["policy"][0, 10:14]
             ang_error = quat_error_magnitude(des_ang, true_ang).cpu().item()
 
             total_error = lin_vel_error + ang_error
@@ -237,13 +229,13 @@ def main():
 
         wandb.log(log_row)
 
-        log_df = log_df._append(log_row, ignore_index=True)
+        log_rows.append(log_row)
 
         action_iter = action_iter + 1
         action_ix = action_iter // steps_per_action
 
     # save logs dataframe
-    log_df.to_csv(eval_csv_path)
+    pd.DataFrame(log_rows).to_csv(eval_csv_path, index=False)
 
     # close the simulator
     env.close()
