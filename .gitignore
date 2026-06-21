@@ -12,3 +12,11 @@ runs/
 logs/
 *.pt
 *.onnx
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+runs/
+logs/
+*.pt
+*.onnx
