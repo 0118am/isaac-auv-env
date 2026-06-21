@@ -9,7 +9,9 @@ those values to any config object with matching attributes.
 from __future__ import annotations
 
 import copy
+import csv
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -842,6 +844,7 @@ class PoolCalibrationLogColumn:
     units: str
     description: str
     required: bool = True
+    value_type: str = "float"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -849,6 +852,7 @@ class PoolCalibrationLogColumn:
             "units": self.units,
             "description": self.description,
             "required": self.required,
+            "value_type": self.value_type,
         }
 
 
@@ -862,6 +866,7 @@ class PoolCalibrationLogSchema:
     calibration_functions: tuple[str, ...]
     update_keys: tuple[str, ...]
     notes: str = ""
+    minimum_rows: int = 1
 
     @property
     def csv_header(self) -> tuple[str, ...]:
@@ -877,6 +882,56 @@ class PoolCalibrationLogSchema:
             "calibration_functions": list(self.calibration_functions),
             "update_keys": list(self.update_keys),
             "notes": self.notes,
+            "minimum_rows": self.minimum_rows,
+        }
+
+
+@dataclass(frozen=True)
+class PoolCalibrationLogValidationIssue:
+    severity: str
+    filename: str
+    message: str
+    row_number: int | None = None
+    column: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "severity": self.severity,
+            "filename": self.filename,
+            "message": self.message,
+            "row_number": self.row_number,
+            "column": self.column,
+        }
+
+
+@dataclass(frozen=True)
+class PoolCalibrationLogValidationReport:
+    directory: str
+    expected_files: tuple[str, ...]
+    row_counts: dict[str, int]
+    issues: tuple[PoolCalibrationLogValidationIssue, ...]
+
+    @property
+    def error_count(self) -> int:
+        return sum(issue.severity == "error" for issue in self.issues)
+
+    @property
+    def warning_count(self) -> int:
+        return sum(issue.severity == "warning" for issue in self.issues)
+
+    @property
+    def is_valid(self) -> bool:
+        return self.error_count == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "directory": self.directory,
+            "is_valid": self.is_valid,
+            "error_count": self.error_count,
+            "warning_count": self.warning_count,
+            "expected_files": list(self.expected_files),
+            "row_counts": dict(self.row_counts),
+            "issues": [issue.to_dict() for issue in self.issues],
         }
 
 
@@ -1274,7 +1329,7 @@ _CALIBRATION_TASK_DETAILS: dict[str, dict[str, Any]] = {
         "priority": "P2",
         "title": "Model battery voltage sag and thrust scaling.",
         "experiment": "Long bollard-pull or fixed-command runs logging battery voltage and measured thrust.",
-        "calibration_functions": ("fit_thruster_voltage_exponent",),
+        "calibration_functions": ("fit_battery_voltage_sag", "fit_thruster_voltage_exponent"),
         "update_keys": (
             "battery_voltage_nominal",
             "battery_voltage",
@@ -1403,8 +1458,29 @@ _CALIBRATION_TASK_DETAILS: dict[str, dict[str, Any]] = {
 }
 
 
-def _column(name: str, units: str, description: str, required: bool = True) -> PoolCalibrationLogColumn:
-    return PoolCalibrationLogColumn(name, units, description, required)
+def _column(
+    name: str,
+    units: str,
+    description: str,
+    required: bool = True,
+    value_type: str | None = None,
+) -> PoolCalibrationLogColumn:
+    if value_type is None:
+        if name in {
+            "sample_id",
+            "configuration",
+            "thruster_index",
+            "channel_name",
+            "sensor_name",
+            "axis",
+            "parameter_name",
+        }:
+            value_type = "string"
+        elif name == "valid":
+            value_type = "boolean"
+        else:
+            value_type = "float"
+    return PoolCalibrationLogColumn(name, units, description, required, value_type)
 
 
 _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
@@ -1451,6 +1527,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("water_density_kg_m3", "kg/m^3", "Measured pool water density."),
             ),
             "notes": "Use multiple non-coplanar attitudes so com_to_cob_offset is observable in 3D.",
+            "minimum_rows": 3,
         },
     ),
     "rigid_body.inertia_diag": (
@@ -1466,6 +1543,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("moment_kg_m2", "kg m^2", "Measured moment of inertia about the axis."),
             ),
             "notes": "At least six independent axes are needed for a full symmetric 3x3 tensor.",
+            "minimum_rows": 6,
         },
         {
             "dataset_name": "Compound pendulum periods",
@@ -1481,6 +1559,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("pivot_to_com_distance_m", "m", "Perpendicular distance from pivot axis to COM."),
             ),
             "notes": "Keep oscillations small and average over many cycles.",
+            "minimum_rows": 6,
         },
     ),
     "hydrodynamics.added_mass": (
@@ -1510,6 +1589,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("nu_r_dot_r_radps2", "rad/s^2", "Optional measured yaw acceleration.", False),
             ),
             "notes": "If acceleration columns are absent, calibration_tools.finite_difference(...) can estimate them from time_s and nu_r.",
+            "minimum_rows": 8,
         },
     ),
     "hydrodynamics.linear_damping": (),
@@ -1526,6 +1606,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("current_w_z_mps", "m/s", "World-frame current z component."),
             ),
             "notes": "Use ADV, neutral drift marker, or DVL water-track estimates in a stable pool state.",
+            "minimum_rows": 2,
         },
     ),
     "hydrodynamics.water_current_field": (
@@ -1557,6 +1638,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("current_a", "A", "Motor current during the sample.", False),
             ),
             "notes": "Sample forward and reverse separately; keep water, propeller, and guard configuration representative.",
+            "minimum_rows": 3,
         },
     ),
     "thrusters.inflow_lookup_table": (
@@ -1571,6 +1653,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("thrust_n", "N", "Measured axial thrust."),
             ),
             "notes": "Use tow tank, flume, or validated CFD/literature table when pool equipment is unavailable.",
+            "minimum_rows": 6,
         },
     ),
     "thrusters.command_chain": (
@@ -1585,9 +1668,28 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("voltage_v", "V", "Supply voltage during response.", False),
             ),
             "notes": "Include pre-step baseline and enough post-step tail to estimate steady thrust.",
+            "minimum_rows": 4,
         },
     ),
-    "battery.voltage_drop_per_s": (),
+    "battery.voltage_drop_per_s": (
+        {
+            "dataset_name": "Battery voltage sag and thrust scaling",
+            "filename": "battery_voltage_thrust_samples.csv",
+            "description": "Time-voltage samples with optional normalized thrust scale for battery model fitting.",
+            "columns": (
+                _column("time_s", "s", "Sample timestamp."),
+                _column("voltage_v", "V", "Measured battery voltage."),
+                _column(
+                    "thrust_scale",
+                    "-",
+                    "Measured thrust divided by nominal-voltage thrust at the same command.",
+                    False,
+                ),
+            ),
+            "notes": "Use a fixed command/load for sag tests; thrust_scale rows should span non-nominal voltages.",
+            "minimum_rows": 2,
+        },
+    ),
     "pool_boundary.enabled": (
         {
             "dataset_name": "Boundary effect scale samples",
@@ -1602,6 +1704,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("thrust_scale", "-", "Measured thrust ratio relative to open water.", False),
             ),
             "notes": "Repeat the same motion/open-loop thrust trials at matched speeds near and away from boundaries.",
+            "minimum_rows": 2,
         },
     ),
     "free_surface.enabled": (
@@ -1618,6 +1721,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("thrust_scale", "-", "Measured thrust ratio near the surface.", False),
             ),
             "notes": "Record surface_z and keep command/speed envelopes consistent across depths.",
+            "minimum_rows": 2,
         },
     ),
     "tether.enabled": (
@@ -1631,6 +1735,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("velocity_along_tether_mps", "m/s", "Body velocity dotted with direction to anchor."),
             ),
             "notes": "Velocity is negative when the robot moves away from the anchor in the simulator convention.",
+            "minimum_rows": 2,
         },
         {
             "dataset_name": "Tether drag samples",
@@ -1660,6 +1765,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("reference_value", "channel units", "Trusted reference value."),
             ),
             "notes": "Use repeated rows for vector channels or expand channel_name with axis suffixes.",
+            "minimum_rows": 2,
         },
     ),
     "sensors": (
@@ -1676,6 +1782,7 @@ _CALIBRATION_LOG_SCHEMAS: dict[str, tuple[dict[str, Any], ...]] = {
                 _column("valid", "-", "1 when the sensor reported a valid measurement.", False),
             ),
             "notes": "Compute scale, bias, noise, dropout, and range from residuals against references.",
+            "minimum_rows": 2,
         },
     ),
     "domain_randomization": (
@@ -1700,7 +1807,6 @@ _CALIBRATION_LOG_SCHEMAS["hydrodynamics.linear_damping"] = _CALIBRATION_LOG_SCHE
 _CALIBRATION_LOG_SCHEMAS["hydrodynamics.speed_dependent_damping"] = _CALIBRATION_LOG_SCHEMAS[
     "hydrodynamics.added_mass"
 ]
-_CALIBRATION_LOG_SCHEMAS["battery.voltage_drop_per_s"] = _CALIBRATION_LOG_SCHEMAS["thrusters.command_chain"]
 _CALIBRATION_LOG_SCHEMAS["tether.num_segments"] = _CALIBRATION_LOG_SCHEMAS["tether.enabled"]
 
 
@@ -2066,9 +2172,138 @@ def pool_profile_calibration_log_schemas(
                     calibration_functions=task.calibration_functions,
                     update_keys=task.update_keys,
                     notes=str(schema_data.get("notes", "")),
+                    minimum_rows=int(schema_data.get("minimum_rows", 1)),
                 )
             )
     return tuple(schemas)
+
+
+def validate_pool_calibration_log_directory(
+    directory: str | Path,
+    schemas: Sequence[PoolCalibrationLogSchema],
+    max_issues_per_file: int = 50,
+) -> PoolCalibrationLogValidationReport:
+    """Validate experiment CSV files against generated calibration schemas."""
+
+    if int(max_issues_per_file) != max_issues_per_file or int(max_issues_per_file) < 1:
+        raise ValueError("max_issues_per_file must be a positive integer.")
+    root = Path(directory)
+    issues: list[PoolCalibrationLogValidationIssue] = []
+    row_counts: dict[str, int] = {}
+
+    for schema in schemas:
+        path = root / schema.filename
+        row_counts[schema.filename] = 0
+        if not path.exists():
+            issues.append(
+                PoolCalibrationLogValidationIssue(
+                    "error",
+                    schema.filename,
+                    "Expected calibration log file is missing.",
+                )
+            )
+            continue
+        if not path.is_file():
+            issues.append(
+                PoolCalibrationLogValidationIssue(
+                    "error",
+                    schema.filename,
+                    "Expected calibration log path is not a regular file.",
+                )
+            )
+            continue
+
+        file_issue_count = 0
+        truncated = False
+
+        def add_issue(message: str, row_number: int | None = None, column: str | None = None) -> None:
+            nonlocal file_issue_count, truncated
+            if file_issue_count >= int(max_issues_per_file):
+                truncated = True
+                return
+            issues.append(
+                PoolCalibrationLogValidationIssue(
+                    "error",
+                    schema.filename,
+                    message,
+                    row_number=row_number,
+                    column=column,
+                )
+            )
+            file_issue_count += 1
+
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as stream:
+                reader = csv.DictReader(stream)
+                fieldnames = reader.fieldnames
+                if fieldnames is None:
+                    add_issue("CSV header is missing.")
+                    continue
+                if len(fieldnames) != len(set(fieldnames)):
+                    add_issue("CSV header contains duplicate column names.")
+
+                present_columns = set(fieldnames)
+                for column in schema.columns:
+                    if column.required and column.name not in present_columns:
+                        add_issue("Required column is missing from the CSV header.", column=column.name)
+
+                row_count = 0
+                for row_number, row in enumerate(reader, start=2):
+                    if not any(value is not None and value.strip() for value in row.values() if isinstance(value, str)):
+                        continue
+                    row_count += 1
+                    for column in schema.columns:
+                        if column.name not in present_columns:
+                            continue
+                        raw_value = row.get(column.name)
+                        value = "" if raw_value is None else raw_value.strip()
+                        if value == "":
+                            if column.required:
+                                add_issue("Required value is empty.", row_number=row_number, column=column.name)
+                            continue
+                        if not _calibration_log_value_is_valid(value, column.value_type):
+                            add_issue(
+                                f"Value is not a valid {column.value_type}.",
+                                row_number=row_number,
+                                column=column.name,
+                            )
+                row_counts[schema.filename] = row_count
+        except (OSError, csv.Error, UnicodeError) as exc:
+            add_issue(f"Failed to read CSV: {exc}")
+            continue
+
+        if row_counts[schema.filename] < int(schema.minimum_rows):
+            add_issue(
+                f"CSV has {row_counts[schema.filename]} data rows; at least {schema.minimum_rows} are required."
+            )
+        if truncated:
+            issues.append(
+                PoolCalibrationLogValidationIssue(
+                    "warning",
+                    schema.filename,
+                    f"Additional issues were omitted after {max_issues_per_file} errors.",
+                )
+            )
+
+    return PoolCalibrationLogValidationReport(
+        directory=str(root),
+        expected_files=tuple(schema.filename for schema in schemas),
+        row_counts=row_counts,
+        issues=tuple(issues),
+    )
+
+
+def _calibration_log_value_is_valid(value: str, value_type: str) -> bool:
+    if value_type == "string":
+        return value != ""
+    if value_type == "boolean":
+        return value.lower() in {"0", "1", "true", "false", "yes", "no"}
+    if value_type == "float":
+        try:
+            return math.isfinite(float(value))
+        except ValueError:
+            return False
+    raise ValueError(f"Unknown calibration log value_type: {value_type}.")
 
 
 def _validate_lookup_table(

@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from pool_dynamics_profile import (  # noqa: E402
     PoolCalibrationLogSchema,
+    PoolCalibrationLogValidationReport,
     PoolCalibrationTask,
     PoolProfileAuditOptions,
     PoolProfileAuditReport,
@@ -22,6 +23,7 @@ from pool_dynamics_profile import (  # noqa: E402
     pool_profile_calibration_log_schemas,
     pool_profile_calibration_update_template,
     pool_profile_calibration_tasks,
+    validate_pool_calibration_log_directory,
 )
 
 
@@ -60,6 +62,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--write-log-templates",
         type=Path,
         help="Write empty CSV header templates and schemas.json to this directory.",
+    )
+    parser.add_argument(
+        "--validate-log-dir",
+        type=Path,
+        help="Validate experiment CSV files in this directory against the generated schemas.",
+    )
+    parser.add_argument(
+        "--max-log-issues",
+        type=int,
+        default=50,
+        help="Maximum validation errors reported per CSV file.",
     )
     parser.add_argument(
         "--fail-on-warning",
@@ -119,6 +132,27 @@ def write_calibration_log_templates(directory: Path, schemas: tuple[PoolCalibrat
     )
 
 
+def format_calibration_log_validation_report(report: PoolCalibrationLogValidationReport) -> str:
+    lines = [
+        f"Log directory: {report.directory}",
+        f"Valid: {'yes' if report.is_valid else 'no'}",
+        f"Files: {len(report.expected_files)} expected",
+        f"Issues: {report.error_count} errors, {report.warning_count} warnings",
+    ]
+    for issue in report.issues:
+        location = issue.filename
+        if issue.row_number is not None:
+            location += f":{issue.row_number}"
+        if issue.column is not None:
+            location += f" [{issue.column}]"
+        lines.append(f"[{issue.severity.upper()}] {location}: {issue.message}")
+    return "\n".join(lines)
+
+
+def exit_code_for_log_validation(report: PoolCalibrationLogValidationReport) -> int:
+    return 0 if report.is_valid else 2
+
+
 def format_audit_report(report: PoolProfileAuditReport) -> str:
     lines = [
         f"Profile: {report.profile_name}",
@@ -173,7 +207,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         options = audit_options_from_args(args)
-        if args.log_schemas or args.write_log_templates is not None:
+        if args.validate_log_dir is not None:
+            log_schemas = load_calibration_log_schemas(args.profile_json, options)
+            log_validation = validate_pool_calibration_log_directory(
+                args.validate_log_dir,
+                log_schemas,
+                max_issues_per_file=args.max_log_issues,
+            )
+        elif args.log_schemas or args.write_log_templates is not None:
             log_schemas = load_calibration_log_schemas(args.profile_json, options)
         elif args.template:
             template = load_calibration_update_template(args.profile_json, options)
@@ -185,6 +226,13 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"Failed to audit profile: {exc}", file=sys.stderr)
         return 1
+
+    if args.validate_log_dir is not None:
+        if args.json:
+            print(json.dumps(log_validation.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(format_calibration_log_validation_report(log_validation))
+        return exit_code_for_log_validation(log_validation)
 
     if args.log_schemas or args.write_log_templates is not None:
         if args.write_log_templates is not None:

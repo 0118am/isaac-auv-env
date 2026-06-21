@@ -306,6 +306,23 @@ class ThrusterVoltageExponentFit:
 
 
 @dataclass(frozen=True)
+class BatteryVoltageSagFit:
+    initial_voltage: float
+    min_observed_voltage: float
+    voltage_drop_per_s: float
+    residual_rms: float
+    sample_count: int
+    time_origin_s: float
+
+    def to_cfg_updates(self) -> dict[str, Any]:
+        return {
+            "battery_voltage": float(self.initial_voltage),
+            "battery_min_voltage": float(self.min_observed_voltage),
+            "battery_voltage_drop_per_s": float(self.voltage_drop_per_s),
+        }
+
+
+@dataclass(frozen=True)
 class TetherSpringDamperFit:
     slack_length: float
     stiffness: float
@@ -1252,6 +1269,48 @@ def fit_thruster_voltage_exponent(
         float(exponent.item()),
         float(residual_rms.item()),
         sample_count,
+    )
+
+
+def fit_battery_voltage_sag(
+    time_s: torch.Tensor | Sequence[float],
+    voltage_samples: torch.Tensor | Sequence[float],
+    nonnegative_drop: bool = True,
+) -> BatteryVoltageSagFit:
+    """Fit the runtime linear battery model ``V(t) = V0 - drop_per_s * t``."""
+
+    time = torch.as_tensor(time_s, dtype=torch.float32).reshape(-1)
+    voltage = torch.as_tensor(voltage_samples, dtype=torch.float32).reshape(-1)
+    if time.shape != voltage.shape or time.numel() < 2:
+        raise ValueError("time_s and voltage_samples must have matching length >= 2.")
+    if not torch.all(torch.isfinite(time)) or not torch.all(torch.isfinite(voltage)):
+        raise ValueError("Battery voltage samples must contain only finite values.")
+    if torch.any(time[1:] <= time[:-1]):
+        raise ValueError("time_s must be strictly increasing.")
+    if torch.any(voltage <= 0.0):
+        raise ValueError("voltage_samples must be positive.")
+
+    time_origin = time[0]
+    elapsed = time - time_origin
+    centered_time = elapsed - torch.mean(elapsed)
+    centered_voltage = voltage - torch.mean(voltage)
+    denom = torch.sum(centered_time * centered_time)
+    if denom <= 0.0:
+        raise ValueError("time_s does not span a usable interval.")
+    slope = torch.sum(centered_time * centered_voltage) / denom
+    drop = -slope
+    if nonnegative_drop:
+        drop = torch.clamp(drop, min=0.0)
+    initial = torch.mean(voltage + drop * elapsed)
+    predicted = initial - drop * elapsed
+    residual = predicted - voltage
+    return BatteryVoltageSagFit(
+        float(initial.item()),
+        float(torch.min(voltage).item()),
+        float(drop.item()),
+        float(torch.sqrt(torch.mean(residual * residual)).item()),
+        int(voltage.numel()),
+        float(time_origin.item()),
     )
 
 

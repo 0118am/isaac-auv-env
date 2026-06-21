@@ -44,6 +44,17 @@ profile_builder_cli = _load_module(
     "build_pool_profile_from_calibration",
     "custom_workflows/build_pool_profile_from_calibration.py",
 )
+static_fit_cli = _load_module("fit_pool_static_logs", "custom_workflows/fit_pool_static_logs.py")
+thruster_fit_cli = _load_module("fit_pool_thruster_logs", "custom_workflows/fit_pool_thruster_logs.py")
+environment_fit_cli = _load_module(
+    "fit_pool_environment_logs",
+    "custom_workflows/fit_pool_environment_logs.py",
+)
+hydrodynamics_fit_cli = _load_module(
+    "fit_pool_hydrodynamics_logs",
+    "custom_workflows/fit_pool_hydrodynamics_logs.py",
+)
+tether_fit_cli = _load_module("fit_pool_tether_logs", "custom_workflows/fit_pool_tether_logs.py")
 
 
 def _assert_raises(error_type, callback, *args, **kwargs):
@@ -52,6 +63,12 @@ def _assert_raises(error_type, callback, *args, **kwargs):
     except error_type:
         return
     raise AssertionError(f"Expected {error_type.__name__}.")
+
+
+def _write_csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
+    lines = [",".join(header)]
+    lines.extend(",".join(str(value) for value in row) for row in rows)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_relative_damping_dissipates_relative_motion():
@@ -263,6 +280,101 @@ def test_calibration_fits_full_matrix_added_mass_and_damping_from_synthetic_log(
     assert torch.allclose(fit.quadratic_damping, quadratic, atol=1.0e-4)
     assert fit.symmetrized_added_mass is True
     assert fit.to_cfg_updates()["added_mass_diag"] == fit.added_mass.tolist()
+
+
+def test_hydrodynamics_calibration_log_pipeline_fits_full_physical_matrices():
+    torch.manual_seed(17)
+    sample_count = 180
+    time_s = torch.arange(sample_count, dtype=torch.float32) * 0.05
+    acceleration = torch.randn(sample_count, 6)
+    nu_r = torch.randn(sample_count, 6)
+    profile = profiles.NOMINAL_POOL_DYNAMICS_PROFILE
+    rigid_mass = torch.zeros(6, 6)
+    rigid_mass[0:3, 0:3] = torch.eye(3) * profile.rigid_body.mass
+    rigid_mass[3:6, 3:6] = rigid_body_properties.inertia_matrix_tensor(
+        profile.rigid_body.inertia_diag,
+        torch.device("cpu"),
+    )
+    added_base = torch.tensor(
+        [
+            [1.2, 0.1, 0.0, 0.0, 0.0, 0.04],
+            [0.1, 1.4, 0.08, 0.0, 0.0, 0.03],
+            [0.0, 0.08, 1.6, 0.0, 0.05, 0.0],
+            [0.0, 0.0, 0.0, 0.08, 0.01, 0.0],
+            [0.0, 0.0, 0.05, 0.01, 0.10, 0.02],
+            [0.04, 0.03, 0.0, 0.0, 0.02, 0.12],
+        ]
+    )
+    added_mass = 0.5 * (added_base + added_base.T)
+    linear_seed = torch.tensor(
+        [
+            [0.8, 0.05, 0.0, 0.0, 0.0, 0.02],
+            [0.03, 0.9, 0.04, 0.0, 0.0, 0.02],
+            [0.0, 0.04, 1.0, 0.0, 0.03, 0.0],
+            [0.0, 0.0, 0.0, 0.10, 0.01, 0.0],
+            [0.0, 0.0, 0.03, 0.01, 0.11, 0.0],
+            [0.02, 0.02, 0.0, 0.0, 0.0, 0.12],
+        ]
+    )
+    linear_damping = linear_seed.T @ linear_seed + 0.05 * torch.eye(6)
+    quadratic_damping = torch.diag(torch.tensor([2.0, 2.2, 2.4, 0.2, 0.22, 0.24]))
+    wrench = (
+        acceleration @ (rigid_mass + added_mass).T
+        + nu_r @ linear_damping.T
+        + (torch.abs(nu_r) * nu_r) @ quadratic_damping.T
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        header = [
+            "time_s",
+            *hydrodynamics_fit_cli.NU_COLUMNS,
+            *hydrodynamics_fit_cli.WRENCH_COLUMNS,
+            *hydrodynamics_fit_cli.ACCEL_COLUMNS,
+        ]
+        _write_csv(
+            root / hydrodynamics_fit_cli.MOTION_LOG_FILENAME,
+            header,
+            [
+                [
+                    float(time_s[index]),
+                    *nu_r[index].tolist(),
+                    *wrench[index].tolist(),
+                    *acceleration[index].tolist(),
+                ]
+                for index in range(sample_count)
+            ],
+        )
+
+        result = hydrodynamics_fit_cli.fit_hydrodynamics_calibration_logs(root, fit_mode="full")
+        output_path = root / "hydrodynamics_updates.json"
+        report_path = root / "hydrodynamics_report.json"
+        exit_code = hydrodynamics_fit_cli.main(
+            [
+                str(root),
+                "--fit-mode",
+                "full",
+                "--output",
+                str(output_path),
+                "--report",
+                str(report_path),
+            ]
+        )
+        output_updates, output_domain = profile_builder_cli.load_update_payload(output_path)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        merged = profiles.merge_pool_dynamics_cfg_updates(cfg_updates=output_updates)
+
+    assert torch.allclose(torch.tensor(result.cfg_updates["added_mass_diag"]), added_mass, atol=2.0e-4)
+    assert torch.allclose(torch.tensor(result.cfg_updates["linear_damping"]), linear_damping, atol=2.0e-4)
+    assert torch.allclose(torch.tensor(result.cfg_updates["quadratic_damping"]), quadratic_damping, atol=2.0e-4)
+    assert result.diagnostics["design_rank"] == 18
+    assert result.diagnostics["sampled_passivity"]["is_passive"] is True
+    assert result.diagnostics["added_mass_projection"]["projected_min_eigenvalue"] >= -1.0e-6
+    assert exit_code == 0
+    assert output_updates == result.cfg_updates
+    assert output_domain == {}
+    assert merged.hydrodynamics.added_mass == result.cfg_updates["added_mass_diag"]
+    assert report["source_files"] == [hydrodynamics_fit_cli.MOTION_LOG_FILENAME]
 
 
 def test_calibration_projects_added_mass_to_symmetric_psd():
@@ -541,6 +653,112 @@ def test_calibration_fits_inertia_tensor_from_compound_pendulum_periods():
     assert torch.allclose(fit.inertia_tensor, inertia, atol=1.0e-6)
     assert fit.residual_rms < 1.0e-6
     assert fit.design_rank == 6
+
+
+def test_static_calibration_log_pipeline_builds_rigid_body_updates():
+    rho = 997.0
+    gravity_z = -9.81
+    volume = 0.0118
+    offset = torch.tensor([0.04, -0.03, 0.02])
+    inertia = torch.tensor(
+        [
+            [0.31, 0.012, -0.006],
+            [0.012, 0.42, 0.009],
+            [-0.006, 0.009, 0.51],
+        ]
+    )
+    axes = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ]
+    )
+    axes = axes / torch.linalg.norm(axes, dim=-1, keepdim=True)
+    moments = torch.sum((axes @ inertia) * axes, dim=-1)
+    half_sqrt = torch.sqrt(torch.tensor(0.5))
+    quats = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [half_sqrt, half_sqrt, 0.0, 0.0],
+            [half_sqrt, 0.0, half_sqrt, 0.0],
+            [half_sqrt, 0.0, 0.0, half_sqrt],
+        ]
+    )
+    force_w = torch.tensor([[0.0, 0.0, -rho * volume * gravity_z]]).repeat(quats.shape[0], 1)
+    force_b = hydro.quat_apply_wxyz(hydro.quat_conjugate_wxyz(quats), force_w)
+    torques_b = torch.cross(offset.reshape(1, 3).repeat(quats.shape[0], 1), force_b, dim=-1)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write_csv(
+            root / "rigid_body_mass_readings.csv",
+            ["sample_id", "mass_kg", "configuration"],
+            [["m1", 11.48, "pool"], ["m2", 11.52, "pool"]],
+        )
+        _write_csv(
+            root / "rigid_body_buoyancy_forces.csv",
+            [
+                "sample_id",
+                "buoyancy_force_w_x_n",
+                "buoyancy_force_w_y_n",
+                "buoyancy_force_w_z_n",
+                "water_density_kg_m3",
+                "gravity_w_z_mps2",
+            ],
+            [[f"b{index}", 0.0, 0.0, -rho * volume * gravity_z, rho, gravity_z] for index in range(3)],
+        )
+        _write_csv(
+            root / "rigid_body_axis_moments.csv",
+            ["sample_id", "axis_b_x", "axis_b_y", "axis_b_z", "moment_kg_m2"],
+            [
+                [f"i{index}", *axes[index].tolist(), float(moments[index])]
+                for index in range(axes.shape[0])
+            ],
+        )
+        _write_csv(
+            root / "rigid_body_static_buoyancy_torques.csv",
+            [
+                "sample_id",
+                "quat_w",
+                "quat_x",
+                "quat_y",
+                "quat_z",
+                "buoyancy_torque_b_x_nm",
+                "buoyancy_torque_b_y_nm",
+                "buoyancy_torque_b_z_nm",
+                "volume_m3",
+                "water_density_kg_m3",
+            ],
+            [
+                [f"c{index}", *quats[index].tolist(), *torques_b[index].tolist(), volume, rho]
+                for index in range(quats.shape[0])
+            ],
+        )
+
+        result = static_fit_cli.fit_static_calibration_logs(root, gravity_z=gravity_z)
+        output_path = root / "static_updates.json"
+        report_path = root / "static_report.json"
+        exit_code = static_fit_cli.main(
+            [str(root), "--output", str(output_path), "--report", str(report_path)]
+        )
+        output_updates, output_domain = profile_builder_cli.load_update_payload(output_path)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert abs(result.cfg_updates["mass"] - 11.5) < 1.0e-6
+    assert abs(result.cfg_updates["volume"] - volume) < 1.0e-7
+    assert result.cfg_updates["water_rho"] == rho
+    assert torch.allclose(torch.tensor(result.cfg_updates["com_to_cob_offset"]), offset, atol=1.0e-6)
+    assert torch.allclose(torch.tensor(result.cfg_updates["inertia_diag"]), inertia, atol=1.0e-6)
+    assert result.diagnostics["center_of_buoyancy"]["design_rank"] == 3
+    assert result.diagnostics["inertia"]["design_rank"] == 6
+    assert exit_code == 0
+    assert output_updates == result.cfg_updates
+    assert output_domain == {}
+    assert report["source_files"] == list(result.source_files)
 
 
 def test_buoyancy_uses_world_gravity_then_body_frame():
@@ -1282,6 +1500,33 @@ def test_pool_profile_calibration_log_schemas_describe_required_csv_inputs():
     assert by_filename["thruster_static_stand.csv"].to_dict()["columns"][0]["name"] == "thruster_index"
 
 
+def test_pool_calibration_log_validator_detects_bad_values_and_missing_files():
+    schemas = profiles.pool_profile_calibration_log_schemas(profiles.NOMINAL_POOL_DYNAMICS_PROFILE)
+    mass_schema = next(schema for schema in schemas if schema.filename == "rigid_body_mass_readings.csv")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        mass_path = root / mass_schema.filename
+        mass_path.write_text("sample_id,mass_kg,configuration\nscale-1,11.5,pool\n", encoding="utf-8")
+        valid_report = profiles.validate_pool_calibration_log_directory(root, (mass_schema,))
+
+        mass_path.write_text("sample_id,mass_kg,configuration\nscale-1,nan,pool\n", encoding="utf-8")
+        invalid_report = profiles.validate_pool_calibration_log_directory(root, (mass_schema,))
+
+        mass_path.unlink()
+        missing_report = profiles.validate_pool_calibration_log_directory(root, (mass_schema,))
+
+    assert valid_report.is_valid
+    assert valid_report.row_counts[mass_schema.filename] == 1
+    assert valid_report.to_dict()["error_count"] == 0
+    assert audit_cli.exit_code_for_log_validation(valid_report) == 0
+    assert not invalid_report.is_valid
+    assert any(issue.column == "mass_kg" and "valid float" in issue.message for issue in invalid_report.issues)
+    assert audit_cli.exit_code_for_log_validation(invalid_report) == 2
+    assert not missing_report.is_valid
+    assert any("missing" in issue.message for issue in missing_report.issues)
+
+
 def test_pool_dynamics_profile_audit_accepts_configured_pool_profile_without_warnings():
     full_linear = [[0.0 for _ in range(6)] for _ in range(6)]
     full_added_mass = [[0.0 for _ in range(6)] for _ in range(6)]
@@ -1368,6 +1613,10 @@ def test_pool_profile_audit_cli_loads_profile_json_and_sets_exit_code():
         schemas_json = log_template_dir / "schemas.json"
         mass_csv_text = mass_csv.read_text(encoding="utf-8")
         schemas_json_data = json.loads(schemas_json.read_text(encoding="utf-8"))
+        mass_schema = next(schema for schema in log_schemas if schema.filename == mass_csv.name)
+        mass_csv.write_text(mass_csv_text + "scale-1,11.5,pool\n", encoding="utf-8")
+        log_validation = profiles.validate_pool_calibration_log_directory(log_template_dir, (mass_schema,))
+        log_validation_text = audit_cli.format_calibration_log_validation_report(log_validation)
 
     assert "Profile: bluerov2-heavy-nominal-pool" in text
     assert "Readiness score:" in text
@@ -1382,6 +1631,8 @@ def test_pool_profile_audit_cli_loads_profile_json_and_sets_exit_code():
     assert any(schema.filename == "sensor_reference_log.csv" for schema in log_schemas)
     assert mass_csv_text.startswith("sample_id,mass_kg,configuration")
     assert schemas_json_data[0]["filename"]
+    assert log_validation.is_valid
+    assert "Valid: yes" in log_validation_text
 
 
 def test_bluerov2_heavy_vehicle_thrust_calibration():
@@ -1523,6 +1774,121 @@ def test_calibration_fits_thruster_voltage_exponent():
     assert fit.residual_rms < 1.0e-6
     assert updates["battery_voltage_nominal"] == 16.0
     assert updates["battery_voltage_thrust_exponent"] == fit.thrust_exponent
+
+
+def test_calibration_fits_linear_battery_voltage_sag():
+    time_s = torch.tensor([10.0, 11.0, 12.0, 13.0])
+    voltage = torch.tensor([16.0, 15.9, 15.8, 15.7])
+
+    fit = calibration.fit_battery_voltage_sag(time_s, voltage)
+    updates = fit.to_cfg_updates()
+
+    assert abs(fit.initial_voltage - 16.0) < 1.0e-6
+    assert abs(fit.min_observed_voltage - 15.7) < 1.0e-6
+    assert abs(fit.voltage_drop_per_s - 0.1) < 1.0e-6
+    assert fit.residual_rms < 1.0e-6
+    assert fit.sample_count == 4
+    assert fit.time_origin_s == 10.0
+    assert updates["battery_voltage"] == fit.initial_voltage
+    assert updates["battery_min_voltage"] == fit.min_observed_voltage
+
+
+def test_thruster_calibration_log_pipeline_builds_lookup_and_response_updates():
+    command_points = [-1.0, 0.0, 1.0]
+    inflow_points = [-0.5, 0.5]
+    inflow_table = [
+        [-6.0, -4.0],
+        [0.0, 0.0],
+        [4.0, 6.0],
+    ]
+    time_s = torch.arange(0.0, 4.0, 0.02)
+    step_time = 0.5
+    response_delay = 0.14
+    tau = 0.35
+    steady_thrust = 6.0
+    commands = torch.where(time_s < step_time, torch.zeros_like(time_s), torch.ones_like(time_s))
+    response_start = step_time + response_delay
+    thrust = torch.where(
+        time_s <= response_start,
+        torch.zeros_like(time_s),
+        steady_thrust * (1.0 - torch.exp(-(time_s - response_start) / tau)),
+    )
+    battery_time = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    battery_voltage = torch.tensor([16.0, 15.9, 15.8, 15.7])
+    voltage_exponent = 2.3
+    battery_thrust_scale = (battery_voltage / 16.0) ** voltage_exponent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write_csv(
+            root / "thruster_static_stand.csv",
+            ["thruster_index", "command", "thrust_n", "voltage_v", "current_a"],
+            [
+                ["shared", -1.0, -4.0, 16.0, 5.0],
+                ["shared", 0.0, 0.0, 16.0, 0.0],
+                ["shared", 1.0, 6.0, 16.0, 7.0],
+            ],
+        )
+        _write_csv(
+            root / "thruster_inflow_stand.csv",
+            ["thruster_index", "command", "axial_inflow_speed_mps", "thrust_n"],
+            [
+                ["shared", command, inflow, inflow_table[command_index][inflow_index]]
+                for command_index, command in enumerate(command_points)
+                for inflow_index, inflow in enumerate(inflow_points)
+            ],
+        )
+        _write_csv(
+            root / "thruster_step_response.csv",
+            ["time_s", "command", "measured_thrust_n", "voltage_v"],
+            [
+                [float(time_s[index]), float(commands[index]), float(thrust[index]), 16.0]
+                for index in range(time_s.numel())
+            ],
+        )
+        _write_csv(
+            root / "battery_voltage_thrust_samples.csv",
+            ["time_s", "voltage_v", "thrust_scale"],
+            [
+                [float(battery_time[index]), float(battery_voltage[index]), float(battery_thrust_scale[index])]
+                for index in range(battery_time.numel())
+            ],
+        )
+
+        result = thruster_fit_cli.fit_thruster_calibration_logs(root, physics_dt_s=0.02)
+        output_path = root / "thruster_updates.json"
+        report_path = root / "thruster_report.json"
+        exit_code = thruster_fit_cli.main(
+            [
+                str(root),
+                "--physics-dt",
+                "0.02",
+                "--output",
+                str(output_path),
+                "--report",
+                str(report_path),
+            ]
+        )
+        output_updates, output_domain = profile_builder_cli.load_update_payload(output_path)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        profile = profiles.merge_pool_dynamics_cfg_updates(cfg_updates=output_updates)
+
+    assert result.cfg_updates["thruster_lookup_commands"] == command_points
+    assert result.cfg_updates["thruster_lookup_thrusts"] == [-4.0, 0.0, 6.0]
+    assert result.cfg_updates["thruster_inflow_lookup_speeds"] == inflow_points
+    assert result.cfg_updates["thruster_inflow_lookup_thrusts"] == inflow_table
+    assert abs(result.cfg_updates["dyn_time_constant"] - tau) < 0.02
+    assert abs(result.diagnostics["first_order_response"]["response_delay_s"] - response_delay) < 0.03
+    assert result.cfg_updates["thruster_command_delay_steps"] in (6, 7, 8)
+    assert abs(result.cfg_updates["battery_voltage"] - 16.0) < 1.0e-6
+    assert abs(result.cfg_updates["battery_voltage_drop_per_s"] - 0.1) < 1.0e-6
+    assert abs(result.cfg_updates["battery_voltage_thrust_exponent"] - voltage_exponent) < 1.0e-5
+    assert exit_code == 0
+    assert output_updates == result.cfg_updates
+    assert output_domain == {}
+    assert profile.thrusters.use_lookup_table is True
+    assert profile.thrusters.use_inflow_lookup_table is True
+    assert report["source_files"] == list(result.source_files)
 
 
 def test_lookup_table_conversion_interpolates_shared_curve():
@@ -2081,6 +2447,168 @@ def test_calibration_fits_free_surface_effect_scales_from_synthetic_samples():
     assert updates["free_surface_added_mass_scale"] == fit.added_mass_scale
 
 
+def test_environment_calibration_log_pipeline_builds_current_and_proximity_updates():
+    alpha = 0.8
+    time_s = torch.arange(8, dtype=torch.float32)
+    powers = alpha ** torch.arange(len(time_s), dtype=torch.float32)
+    mean_current = torch.tensor([0.1, -0.02, 0.01])
+    current = mean_current.reshape(1, 3) + torch.stack((powers, -0.5 * powers, 0.25 * powers), dim=-1)
+    field_positions = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ]
+    )
+    field_currents = torch.stack(
+        (field_positions[:, 0], field_positions[:, 1], torch.zeros(field_positions.shape[0])),
+        dim=-1,
+    )
+    bounds = [0.0, 10.0, 0.0, 10.0, 0.0, 10.0]
+    boundary_positions = torch.tensor([[1.0, 5.0, 5.0], [0.0, 5.0, 5.0], [5.0, 5.0, 5.0]])
+    boundary_damping, boundary_added_mass, boundary_thrust = pool_effects.calculate_pool_boundary_scales(
+        boundary_positions,
+        bounds=bounds,
+        effect_distance=2.0,
+        damping_scale_at_boundary=1.5,
+        added_mass_scale_at_boundary=1.25,
+        thrust_scale_at_boundary=0.8,
+    )
+    surface_positions = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 0.75], [0.0, 0.0, 0.5], [0.0, 0.0, 0.0]])
+    surface_damping, surface_added_mass, surface_buoyancy, surface_thrust = (
+        pool_effects.calculate_free_surface_scales(
+            surface_positions,
+            surface_z=1.0,
+            effect_distance=0.5,
+            heave_damping_scale_at_surface=1.6,
+            roll_pitch_damping_scale_at_surface=1.25,
+            added_mass_scale_at_surface=1.35,
+            buoyancy_scale_at_surface=0.82,
+            thrust_scale_at_surface=0.65,
+        )
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write_csv(
+            root / "water_current_timeseries.csv",
+            ["time_s", "current_w_x_mps", "current_w_y_mps", "current_w_z_mps"],
+            [[float(time_s[index]), *current[index].tolist()] for index in range(time_s.numel())],
+        )
+        _write_csv(
+            root / "water_current_field_samples.csv",
+            ["pos_x_m", "pos_y_m", "pos_z_m", "current_w_x_mps", "current_w_y_mps", "current_w_z_mps"],
+            [
+                [*field_positions[index].tolist(), *field_currents[index].tolist()]
+                for index in range(field_positions.shape[0])
+            ],
+        )
+        _write_csv(
+            root / "pool_boundary_effect_samples.csv",
+            ["pos_x_m", "pos_y_m", "pos_z_m", "damping_scale", "added_mass_scale", "thrust_scale"],
+            [
+                [
+                    *boundary_positions[index].tolist(),
+                    float(boundary_damping[index, 0]),
+                    float(boundary_added_mass[index, 0]),
+                    float(boundary_thrust[index, 0]),
+                ]
+                for index in range(boundary_positions.shape[0])
+            ],
+        )
+        _write_csv(
+            root / "free_surface_effect_samples.csv",
+            [
+                "pos_z_m",
+                "heave_damping_scale",
+                "roll_pitch_damping_scale",
+                "added_mass_scale",
+                "buoyancy_scale",
+                "thrust_scale",
+            ],
+            [
+                [
+                    float(surface_positions[index, 2]),
+                    float(surface_damping[index, 2]),
+                    float(surface_damping[index, 3]),
+                    float(surface_added_mass[index, 2]),
+                    float(surface_buoyancy[index, 0]),
+                    float(surface_thrust[index, 0]),
+                ]
+                for index in range(surface_positions.shape[0])
+            ],
+        )
+
+        result = environment_fit_cli.fit_environment_calibration_logs(
+            root,
+            current_stage_count=2,
+            current_grid_shape=(2, 2, 1),
+            current_bounds=(0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
+            pool_bounds=bounds,
+            boundary_effect_distance=2.0,
+            surface_z=1.0,
+            surface_effect_distance=0.5,
+        )
+        output_path = root / "environment_updates.json"
+        report_path = root / "environment_report.json"
+        exit_code = environment_fit_cli.main(
+            [
+                str(root),
+                "--current-stages",
+                "2",
+                "--current-grid-shape",
+                "2",
+                "2",
+                "1",
+                "--current-bounds",
+                "0",
+                "1",
+                "0",
+                "1",
+                "0",
+                "1",
+                "--pool-bounds",
+                *[str(value) for value in bounds],
+                "--boundary-effect-distance",
+                "2.0",
+                "--surface-z",
+                "1.0",
+                "--surface-effect-distance",
+                "0.5",
+                "--output",
+                str(output_path),
+                "--report",
+                str(report_path),
+            ]
+        )
+        output_updates, output_domain = profile_builder_cli.load_update_payload(output_path)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        profile = profiles.merge_pool_dynamics_cfg_updates(
+            cfg_updates=output_updates,
+            domain_randomization_updates=output_domain,
+        )
+
+    assert torch.allclose(torch.tensor(result.cfg_updates["water_current_w"]), torch.mean(current, dim=0))
+    assert result.cfg_updates["water_current_field_shape"] == [2, 2, 1]
+    assert len(result.cfg_updates["water_current_field_values"]) == 4
+    assert abs(result.cfg_updates["pool_boundary_damping_scale"] - 1.5) < 1.0e-6
+    assert abs(result.cfg_updates["pool_boundary_added_mass_scale"] - 1.25) < 1.0e-6
+    assert abs(result.cfg_updates["pool_boundary_thrust_scale"] - 0.8) < 1.0e-6
+    assert abs(result.cfg_updates["free_surface_heave_damping_scale"] - 1.6) < 1.0e-6
+    assert abs(result.cfg_updates["free_surface_roll_pitch_damping_scale"] - 1.25) < 1.0e-6
+    assert abs(result.cfg_updates["free_surface_added_mass_scale"] - 1.35) < 1.0e-6
+    assert abs(result.cfg_updates["free_surface_buoyancy_scale"] - 0.82) < 1.0e-6
+    assert abs(result.cfg_updates["free_surface_thrust_scale"] - 0.65) < 1.0e-6
+    assert len(result.domain_randomization_updates["water_current_max_by_stage"]) == 2
+    assert exit_code == 0
+    assert output_updates == result.cfg_updates
+    assert output_domain == result.domain_randomization_updates
+    assert profile.pool_boundary.enabled is True
+    assert profile.free_surface.enabled is True
+    assert report["source_files"] == list(result.source_files)
+
+
 def test_calibration_fits_tether_spring_damper_from_synthetic_samples():
     length = torch.tensor([1.8, 2.0, 2.2, 2.5, 3.0, 2.4])
     velocity_along_tether = torch.tensor([0.0, 0.0, 0.0, -0.2, -0.4, 0.3])
@@ -2130,6 +2658,103 @@ def test_calibration_fits_tether_drag_coefficient_from_synthetic_samples():
     assert fit.sample_count == 3
     assert updates["tether_enabled"] is True
     assert updates["tether_drag_coeff"] == fit.drag_coeff
+
+
+def test_tether_calibration_log_pipeline_builds_multisegment_updates():
+    length = torch.tensor([1.8, 2.0, 2.2, 2.5, 3.0, 2.4])
+    velocity_along_tether = torch.tensor([0.0, 0.0, 0.0, -0.2, -0.4, 0.3])
+    slack = 2.0
+    stiffness = 20.0
+    damping = 5.0
+    tension = stiffness * torch.clamp(length - slack, min=0.0) + damping * torch.clamp(
+        -velocity_along_tether,
+        min=0.0,
+    )
+    relative_velocity = torch.tensor([[1.0, 0.0, 0.0], [0.0, -2.0, 0.0], [0.0, 0.0, 0.5]])
+    drag_coeff = 0.25
+    drag_force = -drag_coeff * torch.linalg.norm(relative_velocity, dim=-1, keepdim=True) * relative_velocity
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write_csv(
+            root / "tether_tension_samples.csv",
+            ["length_m", "tension_n", "velocity_along_tether_mps"],
+            [
+                [float(length[index]), float(tension[index]), float(velocity_along_tether[index])]
+                for index in range(length.numel())
+            ],
+        )
+        _write_csv(
+            root / "tether_drag_samples.csv",
+            [
+                "relative_velocity_x_mps",
+                "relative_velocity_y_mps",
+                "relative_velocity_z_mps",
+                "drag_force_x_n",
+                "drag_force_y_n",
+                "drag_force_z_n",
+            ],
+            [
+                [*relative_velocity[index].tolist(), *drag_force[index].tolist()]
+                for index in range(relative_velocity.shape[0])
+            ],
+        )
+
+        result = tether_fit_cli.fit_tether_calibration_logs(
+            root,
+            anchor_pos_w=(1.0, 2.0, 3.0),
+            attach_offset_b=(-0.25, 0.0, 0.0),
+            num_segments=4,
+            segment_diameter=0.006,
+            segment_density=1200.0,
+            segment_buoyancy_density=997.0,
+            slack_length_candidates=(1.8, 2.0, 2.2),
+        )
+        output_path = root / "tether_updates.json"
+        report_path = root / "tether_report.json"
+        exit_code = tether_fit_cli.main(
+            [
+                str(root),
+                "--anchor-pos-w",
+                "1",
+                "2",
+                "3",
+                "--attach-offset-b",
+                "-0.25",
+                "0",
+                "0",
+                "--num-segments",
+                "4",
+                "--segment-diameter",
+                "0.006",
+                "--segment-density",
+                "1200",
+                "--slack-candidates",
+                "1.8",
+                "2.0",
+                "2.2",
+                "--output",
+                str(output_path),
+                "--report",
+                str(report_path),
+            ]
+        )
+        output_updates, output_domain = profile_builder_cli.load_update_payload(output_path)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        merged = profiles.merge_pool_dynamics_cfg_updates(cfg_updates=output_updates)
+
+    assert abs(result.cfg_updates["tether_slack_length"] - slack) < 1.0e-6
+    assert abs(result.cfg_updates["tether_stiffness"] - stiffness) < 3.0e-5
+    assert abs(result.cfg_updates["tether_damping"] - damping) < 3.0e-5
+    assert abs(result.cfg_updates["tether_drag_coeff"] - drag_coeff) < 1.0e-6
+    assert result.cfg_updates["tether_num_segments"] == 4
+    assert result.cfg_updates["tether_segment_diameter"] == 0.006
+    assert exit_code == 0
+    assert output_updates == result.cfg_updates
+    assert output_domain == {}
+    assert merged.tether.enabled is True
+    assert merged.tether.anchor_pos_w == [1.0, 2.0, 3.0]
+    assert report["source_files"] == list(result.source_files)
 
 
 def test_pool_boundary_scales_are_one_away_from_walls():
@@ -2323,6 +2948,7 @@ if __name__ == "__main__":
     test_calibration_fits_full_matrix_linear_quadratic_damping_from_synthetic_log()
     test_calibration_fits_diagonal_added_mass_and_damping_from_synthetic_log()
     test_calibration_fits_full_matrix_added_mass_and_damping_from_synthetic_log()
+    test_hydrodynamics_calibration_log_pipeline_fits_full_physical_matrices()
     test_calibration_projects_added_mass_to_symmetric_psd()
     test_calibration_projects_linear_damping_to_dissipative_preserving_skew()
     test_calibration_checks_sampled_quadratic_damping_power()
@@ -2334,6 +2960,7 @@ if __name__ == "__main__":
     test_calibration_fits_mass_from_scale_readings()
     test_calibration_fits_inertia_tensor_from_axis_moments()
     test_calibration_fits_inertia_tensor_from_compound_pendulum_periods()
+    test_static_calibration_log_pipeline_builds_rigid_body_updates()
     test_buoyancy_uses_world_gravity_then_body_frame()
     test_added_mass_coriolis_is_power_preserving()
     test_full_matrix_added_mass_coriolis_is_power_preserving()
@@ -2360,6 +2987,7 @@ if __name__ == "__main__":
     test_pool_profile_calibration_tasks_include_experiment_metadata()
     test_pool_profile_calibration_update_template_groups_missing_fields()
     test_pool_profile_calibration_log_schemas_describe_required_csv_inputs()
+    test_pool_calibration_log_validator_detects_bad_values_and_missing_files()
     test_pool_dynamics_profile_audit_accepts_configured_pool_profile_without_warnings()
     test_pool_profile_audit_cli_loads_profile_json_and_sets_exit_code()
     test_bluerov2_heavy_vehicle_thrust_calibration()
@@ -2368,6 +2996,8 @@ if __name__ == "__main__":
     test_calibration_fits_thruster_inflow_lookup_table_from_grid_samples()
     test_calibration_fits_thruster_first_order_response_from_step_log()
     test_calibration_fits_thruster_voltage_exponent()
+    test_calibration_fits_linear_battery_voltage_sag()
+    test_thruster_calibration_log_pipeline_builds_lookup_and_response_updates()
     test_lookup_table_conversion_interpolates_shared_curve()
     test_lookup_table_conversion_supports_per_thruster_curves()
     test_inflow_lookup_table_conversion_interpolates_shared_surface()
@@ -2397,8 +3027,10 @@ if __name__ == "__main__":
     test_calibration_builds_water_current_field_grid_from_samples()
     test_calibration_fits_pool_boundary_effect_scales_from_synthetic_samples()
     test_calibration_fits_free_surface_effect_scales_from_synthetic_samples()
+    test_environment_calibration_log_pipeline_builds_current_and_proximity_updates()
     test_calibration_fits_tether_spring_damper_from_synthetic_samples()
     test_calibration_fits_tether_drag_coefficient_from_synthetic_samples()
+    test_tether_calibration_log_pipeline_builds_multisegment_updates()
     test_pool_boundary_scales_are_one_away_from_walls()
     test_pool_boundary_scales_increase_near_boundary()
     test_free_surface_scales_affect_heave_roll_pitch_near_surface()
