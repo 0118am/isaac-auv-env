@@ -48,7 +48,7 @@ class WarpAUVTrajPPORunnerCfg(WarpAUVPPORunnerCfg):
     # At 60 Hz, 256 rollout steps give about 4.27 s of PPO credit assignment,
     # which better matches the slower underwater hydrodynamic response.
     num_steps_per_env = 256
-    max_iterations = 400
+    max_iterations = 600
     experiment_name = "warpauv_traj_heavy2_direct"
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,

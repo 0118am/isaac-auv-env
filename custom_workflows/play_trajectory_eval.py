@@ -79,6 +79,47 @@ parser.add_argument(
     default=False,
     help="Keep Isaac Sim open after eval so the live trails can be inspected.",
 )
+parser.add_argument(
+    "--eval_current",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("VX", "VY", "VZ"),
+    help="Fixed world-frame water current in m/s for disturbance eval.",
+)
+parser.add_argument(
+    "--eval_smooth_current",
+    action="store_true",
+    default=False,
+    help="Let eval_current drift smoothly around its mean with a low-frequency current model.",
+)
+parser.add_argument(
+    "--eval_current_variation_std",
+    type=float,
+    default=0.0,
+    help="Std of smooth current variation in m/s. Used with --eval_smooth_current.",
+)
+parser.add_argument(
+    "--eval_current_tau",
+    type=float,
+    default=12.0,
+    help="Time constant in seconds for smooth current disturbance eval.",
+)
+parser.add_argument("--eval_damping_scale", type=float, default=1.0, help="Multiply linear/quadratic damping.")
+parser.add_argument("--eval_thruster_scale", type=float, default=1.0, help="Multiply all thruster force outputs.")
+parser.add_argument(
+    "--eval_thruster_tau_scale",
+    type=float,
+    default=1.0,
+    help="Multiply the first-order thruster response time constant.",
+)
+parser.add_argument("--eval_deadband_scale", type=float, default=1.0, help="Multiply thruster deadband.")
+parser.add_argument(
+    "--disturbance_name",
+    type=str,
+    default=None,
+    help="Optional label used in the output directory name for disturbance eval.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -109,6 +150,93 @@ def _resolve_checkpoint(log_root_path: str, agent_cfg: RslRlOnPolicyRunnerCfg) -
     if args_cli.custom_weights:
         return args_cli.custom_weights
     return get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+
+def _format_token(value: float) -> str:
+    token = f"{value:.3g}".replace("-", "m").replace(".", "p")
+    return token
+
+
+def _sanitize_label(label: str) -> str:
+    return "".join(char if char.isalnum() or char in ("_", "-") else "_" for char in label).strip("_")
+
+
+def _disturbance_enabled() -> bool:
+    current = args_cli.eval_current or [0.0, 0.0, 0.0]
+    return (
+        any(abs(value) > 1.0e-9 for value in current)
+        or args_cli.eval_smooth_current
+        or abs(args_cli.eval_current_variation_std) > 1.0e-9
+        or abs(args_cli.eval_damping_scale - 1.0) > 1.0e-9
+        or abs(args_cli.eval_thruster_scale - 1.0) > 1.0e-9
+        or abs(args_cli.eval_thruster_tau_scale - 1.0) > 1.0e-9
+        or abs(args_cli.eval_deadband_scale - 1.0) > 1.0e-9
+    )
+
+
+def _disturbance_label() -> str:
+    if not _disturbance_enabled():
+        return ""
+    if args_cli.disturbance_name:
+        return _sanitize_label(args_cli.disturbance_name)
+
+    current = args_cli.eval_current or [0.0, 0.0, 0.0]
+    parts = []
+    if any(abs(value) > 1.0e-9 for value in current):
+        parts.append("cur_" + "_".join(_format_token(value) for value in current))
+    if args_cli.eval_smooth_current or args_cli.eval_current_variation_std > 0.0:
+        parts.append(f"smooth{_format_token(args_cli.eval_current_variation_std)}")
+    if abs(args_cli.eval_damping_scale - 1.0) > 1.0e-9:
+        parts.append(f"damp{_format_token(args_cli.eval_damping_scale)}")
+    if abs(args_cli.eval_thruster_scale - 1.0) > 1.0e-9:
+        parts.append(f"thr{_format_token(args_cli.eval_thruster_scale)}")
+    if abs(args_cli.eval_thruster_tau_scale - 1.0) > 1.0e-9:
+        parts.append(f"tau{_format_token(args_cli.eval_thruster_tau_scale)}")
+    if abs(args_cli.eval_deadband_scale - 1.0) > 1.0e-9:
+        parts.append(f"dead{_format_token(args_cli.eval_deadband_scale)}")
+    return _sanitize_label("_".join(parts) or "disturbance")
+
+
+def _apply_eval_cfg_disturbance(env_cfg) -> None:
+    current = args_cli.eval_current or [0.0, 0.0, 0.0]
+    env_cfg.water_current_w = [float(value) for value in current]
+
+    if abs(args_cli.eval_damping_scale - 1.0) > 1.0e-9:
+        env_cfg.linear_damping = [float(value) * args_cli.eval_damping_scale for value in env_cfg.linear_damping]
+        env_cfg.quadratic_damping = [float(value) * args_cli.eval_damping_scale for value in env_cfg.quadratic_damping]
+
+    if abs(args_cli.eval_thruster_tau_scale - 1.0) > 1.0e-9:
+        env_cfg.dyn_time_constant = float(env_cfg.dyn_time_constant) * args_cli.eval_thruster_tau_scale
+
+    if abs(args_cli.eval_deadband_scale - 1.0) > 1.0e-9:
+        env_cfg.thruster_deadband = float(env_cfg.thruster_deadband) * args_cli.eval_deadband_scale
+
+    smooth_current = args_cli.eval_smooth_current or args_cli.eval_current_variation_std > 0.0
+    env_cfg.domain_randomization.use_custom_randomization = smooth_current
+    if smooth_current:
+        env_cfg.domain_randomization.water_current_smooth = True
+        env_cfg.domain_randomization.water_current_variation_std_by_stage = [args_cli.eval_current_variation_std] * 5
+        env_cfg.domain_randomization.water_current_tau_range = [
+            args_cli.eval_current_tau,
+            args_cli.eval_current_tau,
+        ]
+
+
+def _apply_eval_runtime_disturbance(env) -> None:
+    device = env.device
+    current = torch.tensor(args_cli.eval_current or [0.0, 0.0, 0.0], dtype=torch.float32, device=device)
+    env.water_current_w[:] = current.reshape(1, 3)
+
+    if hasattr(env, "water_current_mean_w"):
+        env.water_current_mean_w[:] = current.reshape(1, 3)
+        horizontal_limit = torch.linalg.norm(current[0:2]).item() + 3.0 * max(args_cli.eval_current_variation_std, 0.0)
+        vertical_limit = abs(current[2].item()) + 1.5 * max(args_cli.eval_current_variation_std, 0.0)
+        env.water_current_horizontal_max[:] = horizontal_limit
+        env.water_current_vertical_max[:] = vertical_limit
+        env.water_current_tau[:] = args_cli.eval_current_tau
+
+    if hasattr(env, "thruster_force_scale") and abs(args_cli.eval_thruster_scale - 1.0) > 1.0e-9:
+        env.thruster_force_scale[:] = args_cli.eval_thruster_scale
 
 
 class TrajectoryEvalVisualizer:
@@ -274,11 +402,13 @@ def main():
     env_cfg.cap_episode_length = False
     env_cfg.use_boundaries = False
     env_cfg.domain_randomization.use_custom_randomization = False
+    _apply_eval_cfg_disturbance(env_cfg)
 
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env)
+    _apply_eval_runtime_disturbance(env.unwrapped)
 
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = _resolve_checkpoint(log_root_path, agent_cfg)
@@ -293,10 +423,13 @@ def main():
     run_name = agent_cfg.load_run or "custom_weights"
     checkpoint_name = os.path.basename(resume_path)
     checkpoint_stem = checkpoint_name[:-3]
-    if args_cli.trajectory == "lissajous":
-        result_dir_name = checkpoint_stem + "_trajectory_eval"
-    else:
-        result_dir_name = checkpoint_stem + "_" + args_cli.trajectory + "_trajectory_eval"
+    disturbance_label = _disturbance_label()
+    result_parts = [checkpoint_stem]
+    if args_cli.trajectory != "lissajous":
+        result_parts.append(args_cli.trajectory)
+    if disturbance_label:
+        result_parts.append(disturbance_label)
+    result_dir_name = "_".join(result_parts) + "_trajectory_eval"
 
     save_path = os.path.join(
         "source",
@@ -347,13 +480,18 @@ def main():
 
             actions = policy(obs)
             action_norms = torch.norm(actions, dim=1)
+            water_current_w = env.unwrapped.water_current_w
 
             for env_id in range(target_pos_w.shape[0]):
                 log_rows.append(
                     {
                         "trajectory": args_cli.trajectory,
+                        "disturbance": disturbance_label or "nominal",
                         "env_id": env_id,
                         "time": t,
+                        "water_current_x": water_current_w[env_id, 0].cpu().item(),
+                        "water_current_y": water_current_w[env_id, 1].cpu().item(),
+                        "water_current_z": water_current_w[env_id, 2].cpu().item(),
                         "desired_x": target_pos_w[env_id, 0].cpu().item(),
                         "desired_y": target_pos_w[env_id, 1].cpu().item(),
                         "desired_z": target_pos_w[env_id, 2].cpu().item(),
@@ -384,11 +522,32 @@ def main():
     velocity_errors = log_df["velocity_error"].to_numpy()
     summary = {
         "trajectory": args_cli.trajectory,
+        "disturbance": disturbance_label or "nominal",
         "num_curves": int(log_df["env_id"].nunique()),
         "position_rmse": float(np.sqrt(np.mean(position_errors**2))),
         "position_mae": float(np.mean(position_errors)),
         "max_position_error": float(np.max(position_errors)),
         "velocity_rmse": float(np.sqrt(np.mean(velocity_errors**2))),
+        "mean_water_current_norm": float(
+            np.mean(
+                np.linalg.norm(
+                    log_df[["water_current_x", "water_current_y", "water_current_z"]].to_numpy(),
+                    axis=1,
+                )
+            )
+        ),
+        "max_water_current_norm": float(
+            np.max(
+                np.linalg.norm(
+                    log_df[["water_current_x", "water_current_y", "water_current_z"]].to_numpy(),
+                    axis=1,
+                )
+            )
+        ),
+        "eval_damping_scale": float(args_cli.eval_damping_scale),
+        "eval_thruster_scale": float(args_cli.eval_thruster_scale),
+        "eval_thruster_tau_scale": float(args_cli.eval_thruster_tau_scale),
+        "eval_deadband_scale": float(args_cli.eval_deadband_scale),
     }
     pd.DataFrame([summary]).to_csv(summary_csv_path, index=False)
     print(f"[INFO]: Summary metrics: {summary}")

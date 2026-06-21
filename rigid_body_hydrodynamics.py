@@ -45,6 +45,88 @@ def skew_symmetric(vec: torch.Tensor) -> torch.Tensor:
     return mat
 
 
+def expand_6d_matrix(values: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Return a batched 6x6 matrix from diagonal vectors or full matrices."""
+
+    if values.ndim == 1:
+        if values.shape[0] != 6:
+            raise ValueError(f"Expected a 6-vector, got shape {tuple(values.shape)}.")
+        return torch.diag_embed(values.reshape(1, 6).repeat(batch_size, 1))
+
+    if values.ndim == 2:
+        if values.shape == (6, 6):
+            return values.reshape(1, 6, 6).repeat(batch_size, 1, 1)
+        if values.shape[1] == 6:
+            if values.shape[0] == 1:
+                values = values.repeat(batch_size, 1)
+            elif values.shape[0] != batch_size:
+                raise ValueError(f"Expected batch size {batch_size}, got shape {tuple(values.shape)}.")
+            return torch.diag_embed(values)
+
+    if values.ndim == 3 and values.shape[1:] == (6, 6):
+        if values.shape[0] == 1:
+            return values.repeat(batch_size, 1, 1)
+        if values.shape[0] == batch_size:
+            return values
+
+    raise ValueError(f"Expected a 6-vector, batched 6-vector, or 6x6 matrix, got shape {tuple(values.shape)}.")
+
+
+def multiply_6d_matrix(values: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    """Multiply diagonal-vector or full-matrix 6D coefficients by a 6-vector."""
+
+    matrix = expand_6d_matrix(values, vector.shape[0])
+    return torch.bmm(matrix, vector.unsqueeze(-1)).squeeze(-1)
+
+
+def calculate_speed_dependent_damping_scale(
+    nu_r: torch.Tensor,
+    speed_points: torch.Tensor | list[float] | tuple[float, ...],
+    scale_points: torch.Tensor | list[float] | list[list[float]] | tuple,
+    clamp: bool = True,
+) -> torch.Tensor:
+    """Interpolate per-DOF damping scales from ``|nu_r|``.
+
+    ``scale_points`` may be shaped ``(num_speed_points,)`` for one shared curve
+    or ``(num_speed_points, 6)`` for per-DOF curves.  The result has shape
+    ``(num_envs, 6)`` and is intended to multiply linear or quadratic damping
+    coefficients before evaluating the Fossen damping wrench.
+    """
+
+    if nu_r.ndim != 2 or nu_r.shape[1] != 6:
+        raise ValueError(f"nu_r must have shape (N, 6), got {tuple(nu_r.shape)}.")
+
+    speeds = torch.as_tensor(speed_points, dtype=nu_r.dtype, device=nu_r.device)
+    scales = torch.as_tensor(scale_points, dtype=nu_r.dtype, device=nu_r.device)
+    if speeds.ndim != 1 or speeds.numel() < 2:
+        raise ValueError("speed_points must be a 1D sequence with at least two samples.")
+    if torch.any(speeds[1:] <= speeds[:-1]):
+        raise ValueError("speed_points must be strictly increasing.")
+
+    if scales.ndim == 1:
+        if scales.shape[0] != speeds.numel():
+            raise ValueError("scale_points length must match speed_points.")
+        scales = scales.reshape(-1, 1).repeat(1, 6)
+    if scales.ndim != 2 or scales.shape != (speeds.numel(), 6):
+        raise ValueError(f"scale_points must have shape ({speeds.numel()},) or ({speeds.numel()}, 6).")
+
+    query = torch.abs(nu_r)
+    if clamp:
+        query = torch.clamp(query, speeds[0], speeds[-1])
+
+    high = torch.bucketize(query.contiguous(), speeds)
+    high = torch.clamp(high, min=1, max=speeds.numel() - 1)
+    low = high - 1
+
+    x0 = speeds[low]
+    x1 = speeds[high]
+    blend = (query - x0) / torch.clamp(x1 - x0, min=1.0e-6)
+    dof_indices = torch.arange(6, dtype=torch.long, device=nu_r.device).reshape(1, 6).repeat(nu_r.shape[0], 1)
+    y0 = scales[low, dof_indices]
+    y1 = scales[high, dof_indices]
+    return y0 + blend * (y1 - y0)
+
+
 @dataclass
 class HydrodynamicForceModels:
     num_envs: int
@@ -91,12 +173,15 @@ class HydrodynamicForceModels:
         quadratic_damping: torch.Tensor,
         water_current_w: torch.Tensor,
         added_mass_diag: torch.Tensor | None = None,
+        relative_acceleration_b: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the body-frame fluid wrench.
 
         Damping is evaluated with relative velocity nu_r = nu - nu_c.  The
         dissipation check should therefore use nu_r^T tau_damping <= 0, not
         nu^T tau_damping, because moving water can do work on the vehicle.
+        ``added_mass_diag`` is kept as the legacy argument name, but it accepts
+        either a 6-vector of diagonal coefficients or a full 6x6 matrix.
         """
 
         buoyancy_forces_b, buoyancy_torques_b = self.calculate_buoyancy_forces(
@@ -107,24 +192,25 @@ class HydrodynamicForceModels:
             com_to_cob_offsets,
         )
 
-        if water_current_w.ndim == 1:
-            water_current_w = water_current_w.reshape(1, 3).repeat(self.num_envs, 1)
-        water_current_b = quat_apply_wxyz(quat_conjugate_wxyz(root_quats_w), water_current_w)
+        nu_r = self.calculate_relative_velocity(
+            root_quats_w,
+            root_linvels_b,
+            root_angvels_b,
+            water_current_w,
+        )
 
-        nu = torch.cat((root_linvels_b, root_angvels_b), dim=-1)
-        nu_current = torch.zeros_like(nu)
-        nu_current[:, 0:3] = water_current_b
-        nu_r = nu - nu_current
-
-        damping_diag = linear_damping.reshape(1, 6) + quadratic_damping.reshape(1, 6) * torch.abs(nu_r)
-        damping_wrench = -damping_diag * nu_r
-
-        added_coriolis_wrench = torch.zeros_like(nu)
-        if added_mass_diag is not None and torch.any(added_mass_diag != 0.0):
-            added_coriolis_wrench = -self.calculate_added_mass_coriolis_wrench(nu_r, added_mass_diag)
+        damping_wrench = self.calculate_relative_damping_wrench(nu_r, linear_damping, quadratic_damping)
 
         fluid_wrench = torch.cat((buoyancy_forces_b, buoyancy_torques_b), dim=-1)
-        fluid_wrench = fluid_wrench + damping_wrench + added_coriolis_wrench
+        fluid_wrench = fluid_wrench + damping_wrench
+
+        if added_mass_diag is not None and torch.any(added_mass_diag != 0.0):
+            fluid_wrench = fluid_wrench - self.calculate_added_mass_coriolis_wrench(nu_r, added_mass_diag)
+            if relative_acceleration_b is not None:
+                fluid_wrench = fluid_wrench + self.calculate_added_mass_inertia_wrench(
+                    relative_acceleration_b,
+                    added_mass_diag,
+                )
 
         if self.debug:
             power = torch.sum(nu_r * damping_wrench, dim=-1)
@@ -132,18 +218,36 @@ class HydrodynamicForceModels:
 
         return fluid_wrench[:, 0:3], fluid_wrench[:, 3:6]
 
+    def calculate_relative_velocity(
+        self,
+        root_quats_w: torch.Tensor,
+        root_linvels_b: torch.Tensor,
+        root_angvels_b: torch.Tensor,
+        water_current_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return body-frame relative velocity ``nu_r = nu - nu_current``."""
+
+        if water_current_w.ndim == 1:
+            water_current_w = water_current_w.reshape(1, 3).repeat(self.num_envs, 1)
+        water_current_b = quat_apply_wxyz(quat_conjugate_wxyz(root_quats_w), water_current_w)
+
+        nu = torch.cat((root_linvels_b, root_angvels_b), dim=-1)
+        nu_current = torch.zeros_like(nu)
+        nu_current[:, 0:3] = water_current_b
+        return nu - nu_current
+
     def calculate_added_mass_coriolis_wrench(self, nu_r: torch.Tensor, added_mass_diag: torch.Tensor) -> torch.Tensor:
-        """Compute C_A(nu_r) nu_r for a diagonal added-mass matrix.
+        """Compute ``C_A(nu_r) nu_r`` for diagonal or full added mass.
 
         The environment applies ``-C_A nu_r`` as an external wrench.  The helper
         returns ``C_A nu_r`` so tests can directly check skew-symmetry and power.
         """
 
-        added_mass_diag = added_mass_diag.reshape(1, 6)
+        added_momentum = multiply_6d_matrix(added_mass_diag, nu_r)
         v = nu_r[:, 0:3]
         omega = nu_r[:, 3:6]
-        a_linear = added_mass_diag[:, 0:3] * v
-        a_angular = added_mass_diag[:, 3:6] * omega
+        a_linear = added_momentum[:, 0:3]
+        a_angular = added_momentum[:, 3:6]
 
         c_top = -torch.bmm(skew_symmetric(a_linear), omega.unsqueeze(-1)).squeeze(-1)
         c_bottom = (
@@ -151,6 +255,15 @@ class HydrodynamicForceModels:
             - torch.bmm(skew_symmetric(a_angular), omega.unsqueeze(-1)).squeeze(-1)
         )
         return torch.cat((c_top, c_bottom), dim=-1)
+
+    def calculate_added_mass_inertia_wrench(
+        self,
+        relative_acceleration_b: torch.Tensor,
+        added_mass_diag: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the external wrench ``-M_A dot(nu_r)``."""
+
+        return -multiply_6d_matrix(added_mass_diag, relative_acceleration_b)
 
     def calculate_relative_damping_wrench(
         self,
@@ -160,8 +273,9 @@ class HydrodynamicForceModels:
     ) -> torch.Tensor:
         """Standalone damping helper used by tests and diagnostics."""
 
-        damping_diag = linear_damping.reshape(1, 6) + quadratic_damping.reshape(1, 6) * torch.abs(nu_r)
-        return -damping_diag * nu_r
+        linear_wrench = multiply_6d_matrix(linear_damping, nu_r)
+        quadratic_wrench = multiply_6d_matrix(quadratic_damping, torch.abs(nu_r) * nu_r)
+        return -(linear_wrench + quadratic_wrench)
 
 
 if __name__ == "__main__":
