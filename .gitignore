@@ -4,3 +4,11 @@ __pycache__/
 .venv/
 runs/
 logs/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+runs/
+logs/
+*.pt
+*.onnx
